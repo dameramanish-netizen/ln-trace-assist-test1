@@ -10,9 +10,9 @@
 /*!
  * LN Trace Assist — Full Smart Chat Edition
  * 1. Native Web Streams for massive file sizes (8GB+).
- * 2. NLP Intent Routing via compromise.js (Fixed Priority).
- * 3. Smart Regex for LN Tables, DLLs, and DAL functions.
- * 4. Adaptive One-Pass Direct Stack (Auto-resolves single occurrences).
+ * 2. NLP Intent Routing via compromise.js.
+ * 3. Broad Regex for LN Tables, DLLs, and standard Functions.
+ * 4. Adaptive One-Pass Direct Stack.
  */
 (function () {
   'use strict';
@@ -221,7 +221,6 @@
       let matches = [], displayMatches = [], capped = false, pendingFormText = false;
       let auditCount = 0;
       
-      // Variables for Adaptive One-Pass Stack
       let directStackMap = {}; 
       let firstStackOutput = null;
 
@@ -235,7 +234,6 @@
             var sid = sm ? sm[0] : 'main';
             if (!directStackMap[sid]) directStackMap[sid] = {};
 
-            // Keep a running memory of the active call stack per session
             if (clean.includes('-->>') && clean.includes('(depth') && clean.includes('(in object')) {
                 let dm = clean.match(/\(depth\s+(\d+)\)/);
                 if (dm) directStackMap[sid][parseInt(dm[1], 10)] = clean;
@@ -247,7 +245,6 @@
                 matches.push(clean);
                 displayMatches.push(clean);
 
-                // If it is the FIRST match, take a snapshot of the stack
                 if (matches.length === 1) {
                     let dm = clean.match(/\(depth\s+(\d+)\)/);
                     let targetDepth = dm ? parseInt(dm[1], 10) : 0;
@@ -266,13 +263,12 @@
                 }
                 
                 if (matches.length >= 1000) { capped = true; return true; }
-                return false; // KEEP STREAMING to see if there are more!
+                return false; 
             }
             return false;
         }
         // ---- END DIRECT STACK LOGIC ----
 
-        // Standard logic for tables/audits
         if (pendingFormText && !isAudit) {
            if (clean.includes('3gl call returned:')) displayMatches[displayMatches.length - 1] = clean;
            pendingFormText = false;
@@ -303,7 +299,6 @@
       
       statusEl.textContent = 'Scan complete.';
       
-      // Handle the final outputs
       if (isDirectStack) {
           if (matches.length === 0) {
               botText('Could not find any occurrences of <code>' + queries.join(' + ') + '</code> in this file.');
@@ -318,7 +313,7 @@
               showDebugResults(matches, displayMatches, capped, useTs, file);
           }
       } else if (isAudit) {
-          botText('<b>Audit Summary:</b> The combination <code>' + queries.join(' + ') + '</code> was found <b>' + auditCount.toLocaleString() + '</b> times in this trace.');
+          botText('<b>Audit Summary:</b> <code>' + queries.join(' + ') + '</code> was found <b>' + auditCount.toLocaleString() + '</b> times in this trace.');
       } else {
           showDebugResults(matches, displayMatches, capped, useTs, file);
       }
@@ -497,39 +492,54 @@
   
   async function handleUserMessage(msg) {
     const nlp = await ensureNLP();
-    let doc = nlp(msg.toLowerCase());
+    let rawLower = msg.toLowerCase().trim();
+    let doc = nlp(rawLower);
 
-    // Extract MULTIPLE Entities
-    let tableMatch = msg.match(/[a-z]{5}\d{3}/g) || []; 
-    let funcMatch = msg.match(/[a-z]+\.dll\d+\.[a-z\.]+/g) || []; 
-    let dalMatch = msg.match(/dal\.[a-z\.]+/g) || []; 
+    // 0. QUICK HELP OVERRIDE
+    if (rawLower === 'hi' || rawLower === 'hello' || rawLower === 'menu' || rawLower === 'help') {
+      showMainMenu();
+      return;
+    }
+
+    // 1. EXTRACT ENTITIES (Broadened Regex)
+    let tableMatch = rawLower.match(/[a-z]{5}\d{3}/g) || []; 
+    // Matches ANY function with a dot (spool.open, cisli.dll1305.post, dal.new.object, seq.puts)
+    let funcMatch = rawLower.match(/[a-z0-9_]+\.[a-z0-9_\.]+/g) || []; 
     
-    let targetKeywords = [...new Set([...tableMatch, ...funcMatch, ...dalMatch])];
+    // If they typed a single word that isn't a known intent, treat it as a raw keyword search
+    let isSingleWord = rawLower.indexOf(' ') === -1;
+    let singleWordMatch = (isSingleWord && tableMatch.length === 0 && funcMatch.length === 0) ? [rawLower] : [];
+
+    let targetKeywords = [...new Set([...tableMatch, ...funcMatch, ...singleWordMatch])];
     let hasKeywords = targetKeywords.length > 0;
 
-    let isErrorIntent = doc.has('(error|bug|fail|failed|issue|dal|crash)');
-    let isSearchIntent = doc.has('(function|occurrences|find|search|give)');
+    // 2. DETECT INTENTS (Added typo resilience)
+    let isErrorIntent = doc.has('(error|bug|fail|failed|issue|dal|crash|exception)');
+    let isSearchIntent = doc.has('(function|occurrences|occurrence|find|search|give|show|all)') || rawLower.includes('ocearence') || rawLower.includes('occurence');
     let wantsStack = doc.has('(stack|trace|tree)');
+    let isAuditIntent = doc.has('(audit|summary|count|how many|total)');
+    let isPerfIntent = doc.has('(slow|hang|hanging|performance|speed|delay|time|long|longest)');
+    let isCompareIntent = doc.has('(compare|difference|diverge|working|broken|diff)');
 
-    // 1. INTENT: TABLE AUDIT
-    if (doc.has('(audit|summary|count|how many)')) {
+    // 3. ROUTE LOGIC
+    if (isAuditIntent) {
         if (hasKeywords) {
             botText('I will perform a high-speed audit for <b>' + targetKeywords.join(' + ') + '</b>. Please upload the trace file.');
             startDebuggerFlow({ autoRun: true, presetKeywords: targetKeywords, presetAudit: true });
         } else {
             botText('Which table or function do you want to audit? Please specify a name like <i>tdsls401</i>.');
         }
-    }
-
-    // 2. INTENT: PERFORMANCE
-    else if (doc.has('(slow|hang|hanging|performance|speed|delay|time|long|longest)')) {
+    } 
+    else if (isPerfIntent) {
       let timeValues = doc.numbers().out('array');
       let threshold = timeValues.length > 0 ? parseInt(timeValues[0], 10) : 50;
       botText('Let\'s check performance. I will scan for operations taking longer than <b>' + threshold + 'ms</b>. Please upload the trace.');
       startPerformanceFlow({ autoRun: true, presetThreshold: threshold });
     } 
-
-    // 3. INTENT: DEBUG / ERROR / DIRECT STACK
+    else if (isCompareIntent) {
+      botText('I will map out the call trees. Upload the working trace and the broken trace to see where they diverge.');
+      startCompareFlow();
+    } 
     else if (isErrorIntent || isSearchIntent || wantsStack || hasKeywords) {
       let reply = 'I can map that out for you. Upload the trace file below.';
       
@@ -547,21 +557,11 @@
           presetKeywords: hasKeywords ? targetKeywords : (isErrorIntent ? ['error', 'dal'] : []), 
           presetDal: isErrorIntent && !hasKeywords, 
           presetDepth: hasKeywords && !wantsStack, 
-          presetDirectStack: wantsStack && hasKeywords // Trigger adaptive direct stack
+          presetDirectStack: wantsStack && hasKeywords 
       });
     } 
-    
-    // 4. INTENT: COMPARE
-    else if (doc.has('(compare|difference|diverge|working|broken)')) {
-      botText('I will map out the call trees. Upload the working trace and the broken trace to see where they diverge.');
-      startCompareFlow();
-    } 
-    
-    // 5. FALLBACK / HELP
-    else if (doc.has('(hi|hello|menu|help)')) {
-      showMainMenu();
-    } else {
-      botText('I am not sure I understand. Try asking me things like:<br><i>"Give me a stack of tdsls401"</i><br><i>"Which function took a long time?"</i><br><i>"Audit tdsls401"</i>');
+    else {
+      botText('I am not sure I understand. Try asking me things like:<br><i>"Give me a stack of tdsls401"</i><br><i>"Which function took a long time?"</i><br><i>"Audit spool.open"</i>');
     }
   }
 
@@ -666,7 +666,7 @@
   }
 
   function showMainMenu() { 
-      botText('Hi! I\'m <b>' + CONFIG.title + '</b>. You can chat with me naturally below (e.g., <i>"Give me a stack of tdsls401"</i> or <i>"Check for operations slower than 200ms"</i>) or use the buttons to start.'); 
+      botText('Hi! I\'m <b>' + CONFIG.title + '</b>. You can chat with me naturally below (e.g., <i>"Give me a stack of spool.open"</i> or <i>"Check for operations slower than 200ms"</i>) or use the buttons to start.'); 
       quickReplies([ 
           { label: '🐞 Debug a trace', onClick: startDebuggerFlow }, 
           { label: '🔀 Compare two traces', onClick: startCompareFlow }, 
