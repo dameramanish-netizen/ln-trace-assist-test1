@@ -12,7 +12,7 @@
  * 1. Native Web Streams for massive file sizes (8GB+).
  * 2. NLP Intent Routing via compromise.js (Fixed Priority).
  * 3. Smart Regex for LN Tables, DLLs, and DAL functions.
- * 4. Multi-keyword "AND" filtering.
+ * 4. Adaptive One-Pass Direct Stack (Auto-resolves single occurrences).
  */
 (function () {
   'use strict';
@@ -179,7 +179,16 @@
         statusEl.className = 'ltb-upload-status';
         container.appendChild(statusEl);
         
-        await executeDebugScan(file, preset.presetKeywords || [], preset.presetDal !== false, preset.presetDepth || false, true, statusEl, preset.presetAudit);
+        await executeDebugScan(
+            file, 
+            preset.presetKeywords || [], 
+            preset.presetDal !== false, 
+            preset.presetDepth || false, 
+            true, 
+            statusEl, 
+            preset.presetAudit,
+            preset.presetDirectStack
+        );
       } else {
         proceedToConfig(file);
       }
@@ -202,20 +211,68 @@
 
       wrap.appendChild(createButton('▶ Run search', async function () {
         userText('Run manual search');
-        await executeDebugScan(file, kw.getKeywords(), dalCheck.checked(), depthCheck.checked(), tsCheck.checked(), statusEl, false);
+        await executeDebugScan(file, kw.getKeywords(), dalCheck.checked(), depthCheck.checked(), tsCheck.checked(), statusEl, false, false);
       }, 'primary'));
       addMessage('bot', wrap);
     }
 
-    async function executeDebugScan(file, queries, incDal, incDepth, useTs, statusEl, isAudit) {
+    async function executeDebugScan(file, queries, incDal, incDepth, useTs, statusEl, isAudit, isDirectStack) {
       statusEl.textContent = 'Scanning ' + file.name + '...';
       let matches = [], displayMatches = [], capped = false, pendingFormText = false;
       let auditCount = 0;
+      
+      // Variables for Adaptive One-Pass Stack
+      let directStackMap = {}; 
+      let firstStackOutput = null;
 
       await processStreamedFile(file, (line) => {
         if (BLACKLIST.some(b => line.includes(b))) return false;
         let clean = line.trim();
         
+        // ---- ADAPTIVE DIRECT STACK LOGIC ----
+        if (isDirectStack && queries.length > 0) {
+            var sm = clean.match(/:::\(\d+\):/);
+            var sid = sm ? sm[0] : 'main';
+            if (!directStackMap[sid]) directStackMap[sid] = {};
+
+            // Keep a running memory of the active call stack per session
+            if (clean.includes('-->>') && clean.includes('(depth') && clean.includes('(in object')) {
+                let dm = clean.match(/\(depth\s+(\d+)\)/);
+                if (dm) directStackMap[sid][parseInt(dm[1], 10)] = clean;
+            }
+
+            let matchesAllQs = queries.every(q => clean.toLowerCase().includes(q.toLowerCase()));
+            
+            if (matchesAllQs) {
+                matches.push(clean);
+                displayMatches.push(clean);
+
+                // If it is the FIRST match, take a snapshot of the stack
+                if (matches.length === 1) {
+                    let dm = clean.match(/\(depth\s+(\d+)\)/);
+                    let targetDepth = dm ? parseInt(dm[1], 10) : 0;
+                    let output = [];
+
+                    if (targetDepth > 0) {
+                        let validDepths = Object.keys(directStackMap[sid]).map(Number).filter(d => d <= targetDepth).sort((a,b)=>a-b);
+                        for (let j = 0; j < validDepths.length; j++) {
+                            let t = directStackMap[sid][validDepths[j]];
+                            if (useTs && t.includes('-->>')) t = t.slice(t.indexOf('-->>'));
+                            output.push(t);
+                        }
+                    }
+                    if (!clean.includes('-->>')) output.push(clean);
+                    firstStackOutput = output;
+                }
+                
+                if (matches.length >= 1000) { capped = true; return true; }
+                return false; // KEEP STREAMING to see if there are more!
+            }
+            return false;
+        }
+        // ---- END DIRECT STACK LOGIC ----
+
+        // Standard logic for tables/audits
         if (pendingFormText && !isAudit) {
            if (clean.includes('3gl call returned:')) displayMatches[displayMatches.length - 1] = clean;
            pendingFormText = false;
@@ -223,7 +280,6 @@
         
         let hasDal = TARGETS.some(t => line.includes(t));
         let hasDepth = line.includes('-->>') && line.includes('(depth');
-        
         let matchesAllQs = queries.length > 0 ? queries.every(q => line.toLowerCase().includes(q.toLowerCase())) : false;
         
         let show = false;
@@ -247,16 +303,30 @@
       
       statusEl.textContent = 'Scan complete.';
       
-      if (isAudit) {
-        botText('<b>Audit Summary:</b> The combination <code>' + queries.join(' + ') + '</code> was found <b>' + auditCount.toLocaleString() + '</b> times in this trace.');
+      // Handle the final outputs
+      if (isDirectStack) {
+          if (matches.length === 0) {
+              botText('Could not find any occurrences of <code>' + queries.join(' + ') + '</code> in this file.');
+          } else if (matches.length === 1) {
+              botText('<b>Direct Stack View:</b> Only 1 occurrence found for <code>' + queries.join(' + ') + '</code>');
+              var pre = document.createElement('pre');
+              pre.className = 'ltb-pre';
+              pre.textContent = firstStackOutput.join('\n\n') || "Could not find stack history for this line.";
+              addMessage('bot', pre);
+          } else {
+              botText('Found <b>' + matches.length.toLocaleString() + '</b> occurrences of <code>' + queries.join(' + ') + '</code>. Click the specific occurrence below to extract its stack.');
+              showDebugResults(matches, displayMatches, capped, useTs, file);
+          }
+      } else if (isAudit) {
+          botText('<b>Audit Summary:</b> The combination <code>' + queries.join(' + ') + '</code> was found <b>' + auditCount.toLocaleString() + '</b> times in this trace.');
       } else {
-        showDebugResults(matches, displayMatches, capped, useTs, file);
+          showDebugResults(matches, displayMatches, capped, useTs, file);
       }
     }
 
     function showDebugResults(matches, displayMatches, capped, useTs, file) {
       if (!matches.length) { botText('No matching lines found.'); return; }
-      botText('Found <b>' + matches.length.toLocaleString() + '</b> matching line(s)' + (capped ? ' (capped at 1,000)' : '') + '. Click a row to rebuild the call stack.');
+      if (capped) { botText('Capped at 1,000 matches.'); }
       
       var rows = displayMatches.map(l => [l]);
       var table = createTable(['Filtered trace output'], rows, async function (i) {
@@ -438,7 +508,8 @@
     let hasKeywords = targetKeywords.length > 0;
 
     let isErrorIntent = doc.has('(error|bug|fail|failed|issue|dal|crash)');
-    let isSearchIntent = doc.has('(stack|function|occurrences|trace|find|search|give)');
+    let isSearchIntent = doc.has('(function|occurrences|find|search|give)');
+    let wantsStack = doc.has('(stack|trace|tree)');
 
     // 1. INTENT: TABLE AUDIT
     if (doc.has('(audit|summary|count|how many)')) {
@@ -450,7 +521,7 @@
         }
     }
 
-    // 2. INTENT: PERFORMANCE (MOVED UP FOR PRIORITY)
+    // 2. INTENT: PERFORMANCE
     else if (doc.has('(slow|hang|hanging|performance|speed|delay|time|long|longest)')) {
       let timeValues = doc.numbers().out('array');
       let threshold = timeValues.length > 0 ? parseInt(timeValues[0], 10) : 50;
@@ -458,11 +529,13 @@
       startPerformanceFlow({ autoRun: true, presetThreshold: threshold });
     } 
 
-    // 3. INTENT: DEBUG / ERROR / KEYWORD SEARCH
-    else if (isErrorIntent || isSearchIntent || hasKeywords) {
+    // 3. INTENT: DEBUG / ERROR / DIRECT STACK
+    else if (isErrorIntent || isSearchIntent || wantsStack || hasKeywords) {
       let reply = 'I can map that out for you. Upload the trace file below.';
       
-      if (hasKeywords) {
+      if (wantsStack && hasKeywords) {
+          reply = 'I will extract the stack for <b>' + targetKeywords.join(' + ') + '</b>. Upload the trace.';
+      } else if (hasKeywords) {
           reply = 'I will hunt down lines matching <b>' + targetKeywords.join(' + ') + '</b>. Upload the trace.';
       } else if (isErrorIntent) {
           reply = 'I will scan for errors and DAL exceptions. Upload the trace.';
@@ -473,7 +546,8 @@
           autoRun: true, 
           presetKeywords: hasKeywords ? targetKeywords : (isErrorIntent ? ['error', 'dal'] : []), 
           presetDal: isErrorIntent && !hasKeywords, 
-          presetDepth: hasKeywords 
+          presetDepth: hasKeywords && !wantsStack, 
+          presetDirectStack: wantsStack && hasKeywords // Trigger adaptive direct stack
       });
     } 
     
@@ -487,7 +561,7 @@
     else if (doc.has('(hi|hello|menu|help)')) {
       showMainMenu();
     } else {
-      botText('I am not sure I understand. Try asking me things like:<br><i>"Find dal.save.object for tdsls401"</i><br><i>"Which function took a long time?"</i><br><i>"Audit tdsls401"</i>');
+      botText('I am not sure I understand. Try asking me things like:<br><i>"Give me a stack of tdsls401"</i><br><i>"Which function took a long time?"</i><br><i>"Audit tdsls401"</i>');
     }
   }
 
@@ -592,7 +666,7 @@
   }
 
   function showMainMenu() { 
-      botText('Hi! I\'m <b>' + CONFIG.title + '</b>. You can chat with me naturally below (e.g., <i>"Find dal.save.object for tdsls401"</i> or <i>"Check for operations slower than 200ms"</i>) or use the buttons to start.'); 
+      botText('Hi! I\'m <b>' + CONFIG.title + '</b>. You can chat with me naturally below (e.g., <i>"Give me a stack of tdsls401"</i> or <i>"Check for operations slower than 200ms"</i>) or use the buttons to start.'); 
       quickReplies([ 
           { label: '🐞 Debug a trace', onClick: startDebuggerFlow }, 
           { label: '🔀 Compare two traces', onClick: startCompareFlow }, 
